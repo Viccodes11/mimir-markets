@@ -1,10 +1,15 @@
 /**
  * tests/node/traders-policy.test.ts
  *
- * Unit tests for pure trader policy predicates in agents/traders/policy.ts:
+ * Unit tests for pure trader policy predicates and bounded decision journal
+ * in agents/traders/policy.ts:
  * 1. shouldBuySecondOpinion predicate (BUY_SECOND_OPINION, MIMIR_URL, DRY_RUN, claim fields)
  *    ensuring TRADER_DRY_RUN=1 spends nothing.
  * 2. filterJoinableClaims filtering logic.
+ * 3. TraderDecisionJournal bounded capacity and FIFO eviction.
+ * 4. Deterministic signal, policy revision, and disposition digest computation.
+ * 5. Strict exclusion of private model prompts and signing keys.
+ * 6. Sequence reservation coordination and lifecycle transitions.
  */
 
 import assert from "node:assert/strict";
@@ -18,9 +23,19 @@ import {
   buildSignalIdentity,
   filterJoinableClaims,
   shouldBuySecondOpinion,
+  computeSignalDigest,
+  computePolicyRevisionDigest,
+  computeDispositionDigest,
+  verifyDecisionDigest,
+  assertNoSigningMaterial,
+  stripPrivatePrompts,
+  TraderDecisionJournal,
+  createTraderDecisionJournal,
+  TraderJournalSecurityError,
   type JoinableClaimCandidate,
   type SecondOpinionClaimFields,
 } from "../../agents/traders/policy";
+import type { SequenceReservation } from "../../lib/agents/sequence-manager";
 
 const VALID_CLAIM: SecondOpinionClaimFields = {
   question: "Will Stellar exceed 100k daily operations?",
@@ -32,6 +47,7 @@ const VALID_CLAIM: SecondOpinionClaimFields = {
 
 const TRADER_WALLET = "GDYJ7GZ4WDGYFE6R3HFBUK2GYMFIFP3JHFYSYAME6XISG5BEKZDJVGHN";
 const OTHER_WALLET = "GB5DLP3MNPUXXJ6P67XGD3OV3ZVIMZN3NZDLVDIYQN6JSC2M7QMMBL4E";
+const FAKE_STELLAR_SECRET = "SB5DLP3MNPUXXJ6P67XGD3OV3ZVIMZN3NZDLVDIYQN6JSC2M7QMMBL4E";
 
 test("shouldBuySecondOpinion: returns true when all conditions are satisfied in non-dry-run mode", () => {
   const result = shouldBuySecondOpinion({
@@ -94,7 +110,6 @@ test("shouldBuySecondOpinion: returns false when mimirUrl is unset or empty", ()
 });
 
 test("shouldBuySecondOpinion: returns false when claim or required claim fields are missing", () => {
-  // missing claim entirely
   assert.equal(
     shouldBuySecondOpinion({
       buySecondOpinion: true,
@@ -104,8 +119,6 @@ test("shouldBuySecondOpinion: returns false when claim or required claim fields 
     }),
     false,
   );
-
-  // missing question
   assert.equal(
     shouldBuySecondOpinion({
       buySecondOpinion: true,
@@ -124,8 +137,6 @@ test("shouldBuySecondOpinion: returns false when claim or required claim fields 
     }),
     false,
   );
-
-  // missing resolution_url
   assert.equal(
     shouldBuySecondOpinion({
       buySecondOpinion: true,
@@ -147,19 +158,14 @@ test("shouldBuySecondOpinion: returns false when claim or required claim fields 
 });
 
 test("shouldBuySecondOpinion: supports positional argument signature", () => {
-  // Valid non-dry-run
   assert.equal(
     shouldBuySecondOpinion(true, "https://mimir.example.com", false, VALID_CLAIM),
     true,
   );
-
-  // Dry-run returns false
   assert.equal(
     shouldBuySecondOpinion(true, "https://mimir.example.com", true, VALID_CLAIM),
     false,
   );
-
-  // Disabled buying returns false
   assert.equal(
     shouldBuySecondOpinion(false, "https://mimir.example.com", false, VALID_CLAIM),
     false,
